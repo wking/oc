@@ -96,6 +96,7 @@ func New(f kcmdutil.Factory, streams genericclioptions.IOStreams) *cobra.Command
 	flags.BoolVar(&o.AllowExplicitUpgrade, "allow-explicit-upgrade", o.AllowExplicitUpgrade, "Upgrade even if the upgrade target is not listed in the available versions list.")
 	flags.BoolVar(&o.AllowUpgradeWithWarnings, "allow-upgrade-with-warnings", o.AllowUpgradeWithWarnings, "Upgrade even if an upgrade is in process or a cluster error is blocking the update.")
 	flags.BoolVar(&o.IncludeNotRecommended, "include-not-recommended", o.IncludeNotRecommended, "Display additional updates which are not recommended based on your cluster configuration.")
+	flags.BoolVar(&o.AllowNotRecommended, "allow-not-recommended", o.AllowNotRecommended, "Allows upgrade to a version when it is supported but not recommended for updates")
 
 	cmd.AddCommand(channel.New(f, streams))
 
@@ -114,6 +115,7 @@ type Options struct {
 	Force                    bool
 	Clear                    bool
 	IncludeNotRecommended    bool
+	AllowNotRecommended      bool
 
 	Client configv1client.Interface
 }
@@ -247,12 +249,29 @@ func (o *Options) Run() error {
 					break
 				}
 			}
+			if o.AllowNotRecommended {
+				for _, upgrade := range cv.Status.ConditionalUpdates {
+					if c := findCondition(upgrade.Conditions, "Recommended"); c != nil && c.Status != metav1.ConditionTrue {
+						if upgrade.Release.Version == o.To {
+							update = &configv1.Update{
+								Version: upgrade.Release.Version,
+								Image:   upgrade.Release.Image,
+							}
+							fmt.Fprintf(o.ErrOut, "warning: with --allow-not-recommended you have accepted the risks with %s and bypassing %s=%s %s: %s\n", o.To, c.Type, c.Status, c.Reason, c.Message)
+							break
+						}
+					}
+				}
+			}
 			if update == nil {
 				if len(cv.Status.AvailableUpdates) == 0 {
 					if c := findClusterOperatorStatusCondition(cv.Status.Conditions, configv1.RetrievedUpdates); c != nil && c.Status == configv1.ConditionFalse {
 						return fmt.Errorf("Can't look up image for version %s. %v", o.To, c.Message)
 					}
 					return fmt.Errorf("No available updates, specify --to-image or wait for new updates to be available")
+				}
+				if o.AllowNotRecommended {
+					return fmt.Errorf("The update %s is not one of the conditional or recommended updates", o.To)
 				}
 				return fmt.Errorf("The update %s is not one of the available updates: %s", o.To, strings.Join(versionStrings(cv.Status.AvailableUpdates), ", "))
 			}
