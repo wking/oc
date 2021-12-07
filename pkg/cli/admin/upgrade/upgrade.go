@@ -235,6 +235,7 @@ func (o *Options) Run() error {
 
 	case len(o.To) > 0, len(o.ToImage) > 0:
 		var update *configv1.Update
+		var conditionalUpdate *configv1.Update
 		if len(o.To) > 0 {
 			if o.To == cv.Status.Desired.Version {
 				fmt.Fprintf(o.Out, "info: Cluster is already at version %s\n", o.To)
@@ -249,33 +250,48 @@ func (o *Options) Run() error {
 					break
 				}
 			}
-			if o.AllowNotRecommended {
-				for _, upgrade := range cv.Status.ConditionalUpdates {
-					if c := findCondition(upgrade.Conditions, "Recommended"); c != nil && c.Status != metav1.ConditionTrue {
-						if upgrade.Release.Version == o.To {
-							update = &configv1.Update{
-								Version: upgrade.Release.Version,
-								Image:   upgrade.Release.Image,
-							}
-							fmt.Fprintf(o.ErrOut, "warning: with --allow-not-recommended you have accepted the risks with %s and bypassing %s=%s %s: %s\n", o.To, c.Type, c.Status, c.Reason, c.Message)
-							break
+
+			// Check if the --to version present in condiional update
+			for _, upgrade := range cv.Status.ConditionalUpdates {
+				if c := findCondition(upgrade.Conditions, "Recommended"); c != nil && c.Status != metav1.ConditionTrue {
+					if upgrade.Release.Version == o.To {
+						conditionalUpdate = &configv1.Update{
+							Version: upgrade.Release.Version,
+							Image:   upgrade.Release.Image,
 						}
+						if o.AllowNotRecommended {
+							fmt.Fprintf(o.ErrOut, "warning: with --allow-not-recommended you have accepted the risks with %s and bypassing %s=%s %s: %s\n", o.To, c.Type, c.Status, c.Reason, c.Message)
+						}
+						break
 					}
 				}
 			}
-			if update == nil {
+
+			switch {
+			case update == nil && conditionalUpdate == nil:
 				if len(cv.Status.AvailableUpdates) == 0 {
 					if c := findClusterOperatorStatusCondition(cv.Status.Conditions, configv1.RetrievedUpdates); c != nil && c.Status == configv1.ConditionFalse {
 						return fmt.Errorf("Can't look up image for version %s. %v", o.To, c.Message)
 					}
-					return fmt.Errorf("No available updates, specify --to-image or wait for new updates to be available")
+					return fmt.Errorf("No recommended or conditional updates, specify --to-image or wait for new updates to be available")
 				}
+				return fmt.Errorf("The update %s is not one of the recommended or conditional updates", o.To)
+			case update == nil && conditionalUpdate != nil:
+				if !o.AllowNotRecommended {
+					return fmt.Errorf("The update %s is not one of the recommended updates. But it is available as a conditional update. To accept the risk and to proceed with update use --allow-not-recommended flag", o.To)
+				}
+			case update != nil && conditionalUpdate == nil:
 				if o.AllowNotRecommended {
-					return fmt.Errorf("The update %s is not one of the conditional or recommended updates", o.To)
+					return fmt.Errorf("The update %s is not available as a conditional update but available as a recommended update. To proceed with the update do not use --allow-not-recommended flag", o.To)
 				}
-				return fmt.Errorf("The update %s is not one of the available updates: %s", o.To, strings.Join(versionStrings(cv.Status.AvailableUpdates), ", "))
+			}
+
+			//if user has used --allow-not-recommended and the version is present in conditional edges then the update should proceed
+			if o.AllowNotRecommended {
+				update = conditionalUpdate
 			}
 		}
+
 		if len(o.ToImage) > 0 {
 			var found bool
 			for _, available := range cv.Status.AvailableUpdates {
