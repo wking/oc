@@ -235,94 +235,83 @@ func (o *Options) Run() error {
 
 	case len(o.To) > 0, len(o.ToImage) > 0:
 		var update *configv1.Update
-		var conditionalUpdate *configv1.Update
-		if len(o.To) > 0 {
-			if o.To == cv.Status.Desired.Version {
-				fmt.Fprintf(o.Out, "info: Cluster is already at version %s\n", o.To)
-				return nil
-			}
-			for _, available := range cv.Status.AvailableUpdates {
-				if available.Version == o.To {
-					update = &configv1.Update{
-						Version: available.Version,
-						Image:   available.Image,
-					}
-					break
-				}
-			}
+		if len(o.To) > 0 && o.To == cv.Status.Desired.Version {
+			fmt.Fprintf(o.Out, "info: Cluster is already at version %s\n", o.To)
+			return nil
+		}
 
-			// Check if the --to version present in condiional update
+		if len(o.ToImage) > 0 && o.ToImage == cv.Status.Desired.Image {
+			fmt.Fprintf(o.Out, "info: Cluster is already at %s\n", o.ToImage)
+			return nil
+		}
+
+		possibleTargets = make([]string, 0, len(cv.Status.AvailableUpdates)+len(cs.Status.ConditionalUpdates))
+
+		// check for recommended updates
+		for _, available := range cv.Status.AvailableUpdates {
+			if match, err := targetMatch(&available, o.To, o.ToImage); match && err == nil {
+				update = &configv1.Update{
+					Version: available.Version,
+					Image:   available.Image,
+				}
+				break
+			} else if err != nil {
+				fmt.Fprintf(o.ErrOut, "warning: unable to calculate match: %v\n", err)
+			}
+			possibleTargets = append(possibleTargets, available.Version)
+		}
+
+		if update == nil {
+			// update was not recommended, so check for conditional, but not recommended, updates
 			for _, upgrade := range cv.Status.ConditionalUpdates {
 				if c := findCondition(upgrade.Conditions, "Recommended"); c != nil && c.Status != metav1.ConditionTrue {
-					if upgrade.Release.Version == o.To {
-						conditionalUpdate = &configv1.Update{
+					if match, err := targetMatch(&available, o.To, o.ToImage); match && err == nil {
+						if !o.AllowNotRecommended {
+							return fmt.Errorf("the update %s is not one of the recommended updates, but is available as a conditional update. To accept the %s=%s risk and to proceed with update use --allow-not-recommended.\n  Reason: %s\n  Message: %s\n", upgrade.Release.Version, c.Type, c.Status, c.Reason, strings.ReplaceAll(c.Message, "\n", "\n  "))
+						}
+						update = &configv1.Update{
 							Version: upgrade.Release.Version,
 							Image:   upgrade.Release.Image,
 						}
-						if o.AllowNotRecommended {
-							fmt.Fprintf(o.ErrOut, "warning: with --allow-not-recommended you have accepted the risks with %s and bypassing %s=%s %s: %s\n", o.To, c.Type, c.Status, c.Reason, c.Message)
-						}
+						fmt.Fprintf(o.ErrOut, "warning: with --allow-not-recommended you have accepted the risks with %s and bypassed %s=%s %s: %s\n", upgrade.Release.Version, c.Type, c.Status, c.Reason, c.Message)
 						break
+					} else if err != nil {
+						fmt.Fprintf(o.ErrOut, "warning: unable to calculate match: %v\n", err)
+					}
+					if o.AllowNotRecommended {
+						possibleTargets = append(possibleTargets, upgrade.Release.Version)
 					}
 				}
-			}
-
-			switch {
-			case update == nil && conditionalUpdate == nil:
-				if len(cv.Status.AvailableUpdates) == 0 {
-					if c := findClusterOperatorStatusCondition(cv.Status.Conditions, configv1.RetrievedUpdates); c != nil && c.Status == configv1.ConditionFalse {
-						return fmt.Errorf("Can't look up image for version %s. %v", o.To, c.Message)
-					}
-					return fmt.Errorf("No recommended or conditional updates, specify --to-image or wait for new updates to be available")
-				}
-				return fmt.Errorf("The update %s is not one of the recommended or conditional updates", o.To)
-			case update == nil && conditionalUpdate != nil:
-				if !o.AllowNotRecommended {
-					return fmt.Errorf("The update %s is not one of the recommended updates. But it is available as a conditional update. To accept the risk and to proceed with update use --allow-not-recommended flag", o.To)
-				}
-			case update != nil && conditionalUpdate == nil:
-				if o.AllowNotRecommended {
-					return fmt.Errorf("The update %s is not available as a conditional update but available as a recommended update. To proceed with the update do not use --allow-not-recommended flag", o.To)
-				}
-			}
-
-			//if user has used --allow-not-recommended and the version is present in conditional edges then the update should proceed
-			if o.AllowNotRecommended {
-				update = conditionalUpdate
 			}
 		}
 
-		if len(o.ToImage) > 0 {
-			var found bool
-			for _, available := range cv.Status.AvailableUpdates {
-				// if images exactly match
-				if available.Image == o.ToImage {
-					found = true
-					break
-				}
-				// if digests match (signature verification would match)
-				if refAvailable, err := imagereference.Parse(available.Image); err == nil {
-					if refTo, err := imagereference.Parse(o.ToImage); err == nil {
-						if len(refTo.ID) > 0 && refAvailable.ID == refTo.ID {
-							found = true
-							break
-						}
-					}
-				}
-			}
-			if !found {
-				if !o.AllowExplicitUpgrade {
-					return fmt.Errorf("The requested upgrade image is not one of the available updates, you must pass --allow-explicit-upgrade to continue")
+		if o.ToImage != "" {
+			if o.AllowExplicitUpgrade {
+				update = &configv1.Update{
+					Version: "",
+					Image:   o.ToImage,
 				}
 				fmt.Fprintln(o.ErrOut, "warning: The requested upgrade image is not one of the available updates.  You have used --allow-explicit-upgrade to the update to proceed anyway")
+			} else {
+				return fmt.Errorf("the requested upgrade image is not one of the available updates, you must pass --allow-explicit-upgrade to continue")
 			}
-			if o.ToImage == cv.Status.Desired.Image && !o.AllowExplicitUpgrade {
-				fmt.Fprintf(o.Out, "info: Cluster is already using release image %s\n", o.ToImage)
-				return nil
-			}
-			update = &configv1.Update{
-				Version: "",
-				Image:   o.ToImage,
+		}
+
+		if update == nil {
+			sort.Strings(possibleTargets)
+			c := findClusterOperatorStatusCondition(cv.Status.Conditions, configv1.RetrievedUpdates)
+
+			switch {
+			case c != nil && c.Status != configv1.ConditionTrue:
+				return fmt.Errorf("cannot refresh available updates:\n  Reason: %s\n  Message: %s\n\n", c.Reason, strings.ReplaceAll(c.Message, "\n", "\n  "))
+			case len(possibleTargets) == 0 && o.AllowNotRecommended:
+				return errors.New("no recommended or conditional updates, specify --to-image or wait for new updates to be available")
+			case len(possibleTargets) == 0:
+				return errors.New("no recommended updates, specify --to-image or wait for new updates to be available")
+			case len(possibleTargets) > 0:
+				return fmt.Errorf("the update is not one of the possible targets: %s", strings.Join(possibleTargets, ", "))
+			default:
+				return errors.New("unable to calculate a target update")
 			}
 		}
 
@@ -584,4 +573,34 @@ func checkForUpgrade(cv *configv1.ClusterVersion) error {
 	}
 
 	return errors.New(strings.Join(results, ""))
+}
+
+// targetMatch returns true if the target release matches the target
+// 'to' version string or 'toImage' pullspec.  Empty 'to' or 'toImage'
+// strings will not match, even in the unlikely event that the version
+// and image strings in the 'target' are also empty.
+func targetMatch(target *configv1.Release, to string, toImage string) (bool, error) {
+	if to != "" && target.Version == to {
+		return true, nil
+	}
+
+	if toImage != "" {
+		// if images exactly match
+		if available.Image == o.ToImage {
+			return true, nil
+		}
+
+		// if digests match (signature verification would match)
+		if refTarget, err := imagereference.Parse(target.Image); err != nil {
+			return false, err
+		} else {
+			if refTo, err := imagereference.Parse(toImage); err != nil {
+				return false, err
+			} else if len(refTo.ID) > 0 && refTarget.ID == refTo.ID {
+				return
+			}
+		}
+	}
+
+	return false, nil
 }
